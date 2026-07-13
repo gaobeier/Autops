@@ -144,6 +144,28 @@ class FeishuClient:
                      message_id, msg_type, result.get("code"))
         return result
 
+    def patch_message(self, message_id: str, content: str) -> dict:
+        """更新已发送消息的内容（仅支持 interactive 卡片）。
+
+        API: PATCH /open-apis/im/v1/messages/{message_id}
+
+        Args:
+            message_id: 已发送消息的 ID。
+            content: 新的卡片内容 JSON 字符串。
+
+        Returns:
+            飞书 API 响应字典。
+        """
+        resp = httpx.patch(
+            f"{_FEISHU_BASE}/im/v1/messages/{message_id}",
+            headers=self._headers(),
+            json={"content": content},
+            timeout=10,
+        )
+        result = resp.json()
+        logger.debug("更新消息: msg_id=%s, code=%s", message_id, result.get("code"))
+        return result
+
     # ── 资源下载 ────────────────────────────────────────────────
 
     def download_image(self, message_id: str, file_key: str) -> tuple[bytes, str]:

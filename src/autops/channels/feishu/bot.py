@@ -24,7 +24,11 @@ from uuid import UUID
 import lark_oapi as lark
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage
+from langgraph.types import Command
 from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger,
+)
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 from lark_oapi.ws.client import Client as WsClient
 
@@ -34,6 +38,12 @@ from autops.channels.feishu.reporter import FeishuReporter
 from autops.config.settings import config
 
 logger = logging.getLogger(__name__)
+
+
+# ── 审批卡片会话注册表 ──────────────────────────────────────────
+# thread_id → (reporter, card_message_id)，用于卡片回调后更新卡片并继续发送消息。
+_pending_approvals: dict[str, tuple[FeishuReporter, str]] = {}
+_pending_lock = threading.Lock()
 
 
 def _truncate(text: Any, max_len: int = 500) -> str:
@@ -166,6 +176,11 @@ class AgentObservabilityHandler(BaseCallbackHandler):
 
     def on_chain_error(self, error: Exception, *, run_id: UUID, **kwargs: Any) -> None:
         elapsed = self._get_elapsed(run_id)
+        # Interrupt 是 LangGraph 的正常控制流机制（人工审批暂停），不是错误
+        error_str = str(error)
+        if "Interrupt(" in error_str or "GraphInterrupt" in type(error).__name__:
+            logger.info("[Turn %d] ■ 链路暂停（等待人工审批）", self._turn)
+            return
         logger.error("[Turn %d] ■ 链路错误: 耗时=%.1fs | %s", self._turn, elapsed, error)
 
     # ── 重试 ────────────────────────────────────────────────────
@@ -283,6 +298,314 @@ def _is_mentioned(mentions: list | None, bot_open_id: str) -> bool:
     return False
 
 
+# ── 审批卡片 ────────────────────────────────────────────────────
+
+
+def _build_approval_card(
+    thread_id: str,
+    action_requests: list[dict],
+) -> dict:
+    """构建人工审批飞书卡片。
+
+    Args:
+        thread_id: LangGraph 会话 ID（用于恢复 interrupt）。
+        action_requests: interrupt 中的 action_requests 列表。
+
+    Returns:
+        飞书 interactive 卡片内容字典。
+    """
+    # 截断 args 以避免按钮 value 超过 5KB 限制
+    safe_action_requests: list[dict] = []
+    for req in action_requests:
+        tool_name = req.get("name", "unknown")
+        args = req.get("args", {})
+        # 截断过大的 args（如长命令、长文件内容）
+        safe_args: dict = {}
+        for k, v in args.items():
+            v_str = str(v)
+            if len(v_str) > 500:
+                safe_args[k] = v_str[:500] + "..."
+            else:
+                safe_args[k] = v
+        safe_action_requests.append({"name": tool_name, "args": safe_args})
+
+    # 构建工具调用描述（用于卡片正文展示）
+    items: list[dict] = []
+    for req in action_requests:
+        tool_name = req.get("name", "unknown")
+        args = req.get("args", {})
+        args_str = json.dumps(args, ensure_ascii=False, indent=2)
+        if len(args_str) > 800:
+            args_str = args_str[:800] + "..."
+        items.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"**🔧 工具: `{tool_name}`**\n```\n{args_str}\n```",
+            },
+        })
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "⚠️ 人工审批请求"},
+            "template": "orange",
+        },
+        "elements": [
+            *items,
+            {"tag": "hr"},
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "✅ 批准"},
+                        "type": "primary",
+                        "value": {
+                            "thread_id": thread_id,
+                            "decision": "approve",
+                            # 保存 action_requests 用于回调后构建 done 卡片
+                            "action_requests": safe_action_requests,
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "❌ 拒绝"},
+                        "type": "danger",
+                        "value": {
+                            "thread_id": thread_id,
+                            "decision": "reject",
+                            "action_requests": safe_action_requests,
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def _build_done_card(
+    action_requests: list[dict],
+    decision_type: str,
+) -> dict:
+    """构建已处理状态的卡片（更新原卡片，移除按钮防止重复点击）。
+
+    Args:
+        action_requests: interrupt 中的 action_requests 列表（用于展示内容）。
+        decision_type: "approve" 或 "reject"。
+
+    Returns:
+        更新后的飞书 interactive 卡片内容字典。
+    """
+    items: list[dict] = []
+    for req in action_requests:
+        tool_name = req.get("name", "unknown")
+        args = req.get("args", {})
+        args_str = json.dumps(args, ensure_ascii=False, indent=2)
+        if len(args_str) > 800:
+            args_str = args_str[:800] + "..."
+        items.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"**🔧 工具: `{tool_name}`**\n```\n{args_str}\n```",
+            },
+        })
+
+    if decision_type == "approve":
+        status_text = "✅ 已批准"
+        template = "green"
+    else:
+        status_text = "❌ 已拒绝"
+        template = "red"
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"人工审批 · {status_text}"},
+            "template": template,
+        },
+        "elements": [
+            *items,
+            {"tag": "hr"},
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"**{status_text}** — 已处理，无需重复点击。"},
+            },
+        ],
+    }
+
+
+def _on_card_action(event: P2CardActionTrigger) -> dict:
+    """处理飞书卡片按钮回调。
+
+    关键约束：飞书长连接模式下，回调函数必须在 **3 秒内** 返回，
+    否则客户端会显示"目标回调服务超时未响应"。
+    Agent 执行是耗时操作，必须放到后台线程异步执行。
+
+    参考: https://open.feishu.cn/document/server-side-sdk/python--sdk/handle-callbacks
+
+    Args:
+        event: 飞书卡片回调事件。
+
+    Returns:
+        dict 响应（含 toast 和/或 card），3 秒内返回。
+    """
+    try:
+        action = event.event.action
+        if not action or not action.value:
+            logger.warning("卡片回调缺少 action.value")
+            return {"toast": {"type": "error", "content": "回调数据无效"}}
+
+        value = action.value
+        thread_id = value.get("thread_id", "")
+        decision_type = value.get("decision", "")
+
+        if not thread_id or not decision_type:
+            logger.warning("卡片回调缺少 thread_id 或 decision: %s", value)
+            return {"toast": {"type": "error", "content": "回调数据无效"}}
+
+        logger.info("收到卡片审批: thread_id=%s, decision=%s", thread_id, decision_type)
+
+        # 取出 reporter 和卡片 message_id
+        with _pending_lock:
+            entry = _pending_approvals.pop(thread_id, None)
+
+        if entry is None:
+            # 已处理或重复点击的回调，属于正常情况
+            logger.info("卡片回调无对应会话（已处理或重复点击）: thread_id=%s", thread_id)
+            return {"toast": {"type": "info", "content": "已处理，无需重复操作"}}
+
+        reporter, card_message_id = entry
+
+        # 构造 decision
+        if decision_type == "approve":
+            decision = {"type": "approve"}
+            toast = {"type": "success", "content": "已批准，继续执行"}
+        elif decision_type == "reject":
+            decision = {"type": "reject", "message": "用户拒绝了此操作"}
+            toast = {"type": "info", "content": "已拒绝"}
+        else:
+            logger.warning("未知的 decision 类型: %s", decision_type)
+            return {"toast": {"type": "error", "content": "未知操作"}}
+
+        # 构建已处理状态的卡片
+        done_card = _build_done_card(
+            value.get("action_requests", [{"name": "?", "args": {}}]),
+            decision_type,
+        )
+
+        # 从事件 context 取卡片消息 ID（参考 Go 实现 bot.go:193-195）
+        card_msg_id = ""
+        if event.event and event.event.context:
+            card_msg_id = event.event.context.open_message_id or ""
+        if not card_msg_id:
+            card_msg_id = card_message_id  # 回退到发送时保存的
+
+        # 立即返回 toast 响应（必须在 3 秒内）
+        # 卡片更新和 Agent 执行放到后台线程，避免阻塞回调
+        def _background() -> None:
+            # 1) PATCH 更新卡片
+            if card_msg_id:
+                try:
+                    time.sleep(0.5)  # 延迟确保回调响应已返回
+                    result = reporter.update_card(card_msg_id, done_card)
+                    code = result.get("code", -1) if isinstance(result, dict) else -1
+                    if code == 0:
+                        logger.info("卡片更新成功: msg_id=%s", card_msg_id)
+                    else:
+                        logger.warning(
+                            "卡片更新失败: msg_id=%s, code=%s, response=%s",
+                            card_msg_id, code, result,
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception("异步更新卡片失败")
+
+            # 2) 恢复 Agent 执行
+            try:
+                agent = create_main_agent()
+                result = agent.invoke(
+                    Command(resume={"decisions": [decision]}),
+                    config={
+                        "thread_id": thread_id,
+                        "recursion_limit": config.agent.recursion_limit,
+                    },
+                )
+
+                ai_messages = result.get("messages", [])
+                if ai_messages:
+                    last = ai_messages[-1]
+                    reply = last.content if hasattr(last, "content") else str(last)
+                    reply_str = str(reply)
+                    if reply_str.strip():
+                        logger.info("审批后回复长度: %d 字符", len(reply_str))
+                        reporter.send_text(reply_str)
+
+                # 检查是否还有新的 interrupt（连续多个危险操作）
+                interrupts = result.get("__interrupt__", [])
+                if interrupts:
+                    _handle_interrupts(interrupts, thread_id, reporter)
+            except Exception:  # noqa: BLE001
+                logger.exception("后台 Agent 执行出错")
+
+        threading.Thread(target=_background, daemon=True).start()
+
+        # 立即返回响应（3 秒内）
+        return {"toast": toast}
+
+    except Exception:  # noqa: BLE001
+        logger.exception("卡片回调处理出错")
+        return {"toast": {"type": "error", "content": "处理出错"}}
+
+
+def _handle_interrupts(
+    interrupts: list,
+    thread_id: str,
+    reporter: FeishuReporter,
+) -> bool:
+    """处理 Agent 返回的 interrupt，发送审批卡片。
+
+    Args:
+        interrupts: Agent 返回的 interrupt 列表。
+        thread_id: LangGraph 会话 ID。
+        reporter: 飞书消息报告器。
+
+    Returns:
+        True 表示有 interrupt 需要处理（已发送卡片），False 表示无。
+    """
+    if not interrupts:
+        return False
+
+    # 取第一个 interrupt（通常只有一个）
+    interrupt = interrupts[0]
+    # Interrupt 对象有 value 和 id 属性
+    interrupt_value = getattr(interrupt, "value", interrupt)
+    if isinstance(interrupt_value, dict):
+        action_requests = interrupt_value.get("action_requests", [])
+    else:
+        action_requests = []
+
+    if not action_requests:
+        logger.warning("interrupt 中无 action_requests: %s", interrupt_value)
+        return False
+
+    # 发送审批卡片，获取卡片消息 ID
+    card = _build_approval_card(thread_id, action_requests)
+    send_result = reporter.send_card(card)
+    card_message_id = ""
+    try:
+        card_message_id = send_result.get("data", {}).get("message_id", "")
+    except (AttributeError, TypeError):
+        pass
+
+    # 注册等待审批：thread_id → (reporter, card_message_id)
+    with _pending_lock:
+        _pending_approvals[thread_id] = (reporter, card_message_id)
+
+    logger.info("已发送审批卡片: thread_id=%s, card_msg_id=%s", thread_id, card_message_id)
+    return True
+
+
 # ── 消息处理 ────────────────────────────────────────────────────
 
 
@@ -343,6 +666,13 @@ def _handle_message(
             },
         )
         logger.info("Agent 调用完成 (Turn %d)", handler._turn)
+
+        # 检查是否触发 interrupt（人工审批）
+        interrupts = result.get("__interrupt__", [])
+        if interrupts:
+            if _handle_interrupts(interrupts, thread_id, reporter):
+                # 已发送审批卡片，等待用户在飞书中点击按钮
+                return
 
         ai_messages = result.get("messages", [])
         if ai_messages:
@@ -530,6 +860,7 @@ def run_feishu() -> None:
         .register_p2_im_message_receive_v1(
             lambda event: _on_message_receive(client, event)
         )
+        .register_p2_card_action_trigger(_on_card_action)
         .build()
     )
 

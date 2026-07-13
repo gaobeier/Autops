@@ -1,0 +1,11 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "my_agent": "./src/autops/agents/main_agent.py:create_main_agent"
+  },
+  "env": ".env",
+  "http": {
+    "host": "10.1.1.41",
+    "port": 2024
+  }
+}

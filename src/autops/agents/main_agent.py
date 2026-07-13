@@ -8,10 +8,12 @@ from pathlib import Path
 from deepagents import create_deep_agent
 from deepagents.backends import LocalShellBackend
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph.state import CompiledStateGraph
 
 from autops.config.settings import config
 from autops.llm.client import create_llm
 from autops.prompts.system import get_main_agent_prompt
+from autops.tools import internet_search
 
 logger = logging.getLogger(__name__)
 
@@ -19,26 +21,29 @@ logger = logging.getLogger(__name__)
 _checkpointer: MemorySaver | None = None
 
 
-def _get_workspace() -> Path:
-    """获取 Agent 工作目录。
+def _resolve_workspace() -> Path:
+    """解析 Agent 工作目录路径（不做 I/O）。
 
-    优先使用 config.yaml 中 agent.workspace 配置，
-    未配置则使用项目根目录（config.yaml 所在目录的上一级）。
+    使用 config.yaml 中 agent.workspace 配置，
+    未配置则默认为 ./workspace（相对于项目根目录）。
     """
-    workspace = config.agent.workspace
-    if workspace:
-        p = Path(workspace).resolve()
-    else:
-        p = Path(__file__).resolve().parents[3]
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    return Path(config.agent.workspace).resolve()
+
+
+# 模块级别预计算 workspace 并创建目录。
+# 模块导入在 LangGraph dev 的线程池中执行，允许阻塞 I/O；
+# 而工厂函数 create_main_agent 在事件循环中执行，不能有阻塞调用。
+_WORKSPACE = _resolve_workspace()
+_WORKSPACE.mkdir(parents=True, exist_ok=True)
+logger.info("Agent 工作目录: %s", _WORKSPACE)
 
 
 def _build_backend(workspace: Path) -> LocalShellBackend:
     """构建受限的本地 Shell 后端。
 
     将文件系统和 Shell 执行限制在 workspace 目录内。
-    使用 virtual_mode=True 使路径相对于 root_dir（/ = workspace 根）。
+    Agent 使用真实绝对路径操作文件（如 /opt/Autops/workspace/test.txt），
+    backend 确保所有路径不会逃逸出 root_dir。
     """
     return LocalShellBackend(
         root_dir=str(workspace),
@@ -62,34 +67,32 @@ def _get_checkpointer() -> MemorySaver:
     return _checkpointer
 
 
-def create_main_agent(tools: list | None = None) -> object:
+def create_main_agent() -> CompiledStateGraph:
     """创建主 Agent。
 
-    通过 LocalShellBackend(root_dir, virtual_mode=True) 将 Agent 的
-    文件操作限制在 workspace 目录内（/ = workspace 根）。
+    通过 LocalShellBackend(root_dir, virtual_mode=False) 将 Agent 的
+    文件操作限制在 workspace 目录内，Agent 使用真实绝对路径操作文件。
 
     通过 MemorySaver checkpointer 自动管理多轮对话状态，
     调用时通过 config={"thread_id": session_id} 区分不同会话，
     无需手动维护消息历史。
 
-    Args:
-        tools: 自定义工具列表，默认为空（仅使用 Deepagents 内置工具）。
+    通过 interrupt_on 配置人工审批：edit_file / write_file / execute
+    等危险操作在执行前暂停，等待人工确认后才继续。
+
+    注册 internet_search 自定义工具，提供互联网搜索能力。
 
     Returns:
         编译后的 Deep Agent 实例，可通过 .invoke() 或 .stream() 调用。
     """
-    workspace = _get_workspace()
-    logger.info("Agent 工作目录: %s", workspace)
-
-    llm = create_llm()
-    system_prompt = get_main_agent_prompt()
-    backend = _build_backend(workspace)
-    checkpointer = _get_checkpointer()
-
     return create_deep_agent(
-        model=llm,
-        tools=tools or [],
-        system_prompt=system_prompt,
-        backend=backend,
-        checkpointer=checkpointer,
+        model=create_llm(),
+        tools=[internet_search],
+        system_prompt=get_main_agent_prompt(),
+        backend=_build_backend(_WORKSPACE),
+        checkpointer=_get_checkpointer(),
+        interrupt_on={
+            "edit_file": True,
+            "execute": True,
+        },
     )

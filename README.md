@@ -14,10 +14,11 @@ Autops 是一个面向 SRE（站点可靠性工程）和 DevOps 工作的 AI 智
 | **Docker 管理** | 查看容器状态、启动/停止/重启容器 |
 | **网络诊断** | ping、端口检测、DNS 解析 |
 | **Git 操作** | 查看仓库状态、分支、最近提交 |
+| **互联网搜索** | 基于 Tavily API 搜索技术文档、故障方案、最新资讯 |
 | **子智能体** | 将复杂任务委派给具有独立上下文的子 Agent |
 | **上下文管理** | 自动总结长对话，防止上下文溢出 |
-| **人在回路** | 危险操作前需人工确认 |
-| **飞书通道** | 通过飞书 Bot WebSocket 长连接接收消息，支持群聊 @提及和图片 |
+| **人在回路** | `edit_file`、`write_file`、`execute` 等危险操作执行前暂停；LangGraph Studio 中通过 Resume UI 审批，飞书通道中通过交互式卡片审批 |
+| **飞书通道** | 通过飞书 Bot WebSocket 长连接接收消息，支持群聊 @提及、图片和审批卡片交互 |
 
 ## 技术栈
 
@@ -50,7 +51,19 @@ uv sync
 
 ### 配置
 
-在项目根目录创建 `config.yaml` 文件（参考 `config.yaml` 示例）：
+项目使用两个配置文件，均已加入 `.gitignore`：
+
+**`.env`** — 环境变量（LangSmith API Key 等）：
+
+```env
+# LangSmith API Key（用于 LangGraph Studio 追踪与调试）
+LANGSMITH_API_KEY=lsv2_pt_xxxxxxxxxxxxxxxx
+
+# Tavily API Key（用于互联网搜索工具）
+TAVILY_API_KEY=tvly-dev-xxxxxxxxxxxxxxxx
+```
+
+**`config.yaml`** — 应用配置（LLM、Agent、飞书参数）：
 
 ```yaml
 # 全局日志级别: DEBUG / INFO / WARNING / ERROR
@@ -67,13 +80,11 @@ llm:
 agent:
   max_iterations: 15
   recursion_limit: 100
-  # workspace: /path/to/workspace  # Agent 工作目录限制（留空则使用项目根目录）
+  workspace: ./workspace  # Agent 工作目录限制（默认 ./workspace）
 
 feishu:
   app_id: cli_xxxxxxxxxxxxxxxx
   app_secret: xxxxxxxxxxxxxxxxxxxxxxxxxx
-  webhook_host: 0.0.0.0
-  webhook_port: 8080
 ```
 
 ### 运行
@@ -85,19 +96,42 @@ uv run autops
 # 飞书 WebSocket 长连接模式
 uv run autops feishu
 
+# LangGraph Dev 模式（提供 API + Studio UI，用于开发调试）
+uv run langgraph dev
+
 # 查看帮助
 uv run autops --help
 ```
+
+#### LangGraph Dev 模式
+
+通过 `langgraph dev` 启动开发服务器，提供 REST API 和可视化调试界面：
+
+- **API**：`http://127.0.0.1:2024`
+- **Studio UI**：`https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024`
+- **API 文档**：`http://127.0.0.1:2024/docs`
+
+如需外部访问，可指定 host 和 port：
+
+```bash
+uv run langgraph dev --host 0.0.0.0 --port 2024
+```
+
+> 注：`langgraph-cli[inmem]` 已包含在 dev 依赖中，`uv sync` 后即可使用。
 
 #### 飞书通道配置
 
 1. 在[飞书开放平台](https://open.feishu.cn/)创建应用，获取 `App ID` 和 `App Secret`
 2. 填入 `config.yaml` 的 `feishu` 部分
-3. 在应用「事件订阅」中选择**「使用长连接接收事件」**（无需公网 URL）
-4. 订阅 `im.message.receive_v1` 事件
-5. 运行 `uv run autops feishu` 启动服务
-ngrok http 8080
-```
+3. 在应用「权限管理」中开通以下权限：
+   - `im:message` — 发送/接收消息
+   - `im:message.patches` — 更新已发送的卡片消息（审批后更新状态用）
+   - `im:message.group_at_msg` — 接收群聊 @ 提及
+4. 在应用「事件订阅」中选择**「使用长连接接收事件」**（无需公网 URL）
+5. 订阅以下事件：
+   - `im.message.receive_v1` — 接收消息
+   - `card.action.trigger` — 接收卡片按钮回调（审批用）
+6. 运行 `uv run autops feishu` 启动服务
 
 ## 项目结构
 
@@ -120,12 +154,13 @@ autops/
 │   │   └── templates/           # .j2 模板文件
 │   │       └── main_agent.j2    # 主 Agent 系统提示词模板
 │   └── tools/                   # SRE/DevOps 运维工具集
-│       ├── shell.py             # Shell 命令执行
-│       ├── system.py            # 系统资源监控
-│       ├── logs.py              # 日志分析
-│       ├── docker.py            # Docker 容器管理
-│       ├── network.py           # 网络诊断
-│       └── git_ops.py           # Git 操作
+│       ├── search.py            # 互联网搜索（Tavily API）
+│       ├── shell.py             # Shell 命令执行（规划中）
+│       ├── system.py            # 系统资源监控（规划中）
+│       ├── logs.py              # 日志分析（规划中）
+│       ├── docker.py            # Docker 容器管理（规划中）
+│       ├── network.py           # 网络诊断（规划中）
+│       └── git_ops.py           # Git 操作（规划中）
 ├── pyproject.toml
 ├── config.yaml                 # 配置文件（LLM、Agent 参数）
 ├── CODEBUDDY.md                 # CodeBuddy 项目指令
@@ -157,8 +192,8 @@ autops/
 ## 开发
 
 ```bash
-# 安装开发依赖
-uv sync --extra dev
+# 安装依赖（含 dev 依赖）
+uv sync
 
 # 运行 linter
 uv run ruff check src/

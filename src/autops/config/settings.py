@@ -1,4 +1,4 @@
-"""配置加载模块 — 从 config.yaml 读取项目配置。"""
+"""配置加载模块 — 从 .env 和 config.yaml 读取项目配置。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+
+# 加载 .env 环境变量（LANGSMITH_API_KEY 等），在读取 config.yaml 之前执行
+load_dotenv()
 
 # 日志级别字符串 → logging 常量的映射
 _LOG_LEVELS = {
@@ -27,7 +31,7 @@ class LLMConfig(BaseModel):
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
     temperature: float = 0.7
-    max_tokens: int = 4096
+    # max_tokens: int = 4096
 
 
 class AgentConfig(BaseModel):
@@ -35,7 +39,7 @@ class AgentConfig(BaseModel):
 
     max_iterations: int = 15
     recursion_limit: int = 100
-    workspace: str = ""
+    workspace: str = "./workspace"
 
 
 class FeishuConfig(BaseModel):

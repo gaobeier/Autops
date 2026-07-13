@@ -33,3 +33,5 @@ workspace/
 
 # Python version
 .python-version
+
+.langgraph_api

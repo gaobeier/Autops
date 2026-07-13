@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+
 from autops.channels.feishu.client import FeishuClient
 
 
@@ -33,10 +35,27 @@ class FeishuReporter:
         """
         self.client.send_text(self.chat_id, text, reply_to=self.message_id)
 
-    def send_card(self, card: dict) -> None:
-        """发送交互式卡片消息。
+    def send_card(self, card: dict) -> dict:
+        """发送交互式卡片消息（reply 到原用户消息）。
+
+        审批卡片 reply 到原用户消息，与上下文关联更清晰。
 
         Args:
             card: 卡片内容字典。
+
+        Returns:
+            飞书 API 响应字典（含 message_id）。
         """
-        self.client.send_card(self.chat_id, card, reply_to=self.message_id)
+        return self.client.send_card(self.chat_id, card, reply_to=self.message_id)
+
+    def update_card(self, message_id: str, card: dict) -> dict:
+        """更新已发送的卡片内容。
+
+        Args:
+            message_id: 已发送卡片消息的 ID。
+            card: 新的卡片内容字典。
+
+        Returns:
+            飞书 API 响应字典。
+        """
+        return self.client.patch_message(message_id, json.dumps(card))
