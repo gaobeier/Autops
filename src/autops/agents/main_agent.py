@@ -59,15 +59,14 @@ def _get_checkpointer() -> PostgresSaver:
 
     使用 PostgresSaver（PostgreSQL 持久化存储），进程重启后不丢失。
     首次调用时建立连接并自动建表。
-    在 autops schema 中创建表（避免 public schema 权限问题）。
+    使用 autops 数据库的 public schema。
     """
     global _checkpointer
     if _checkpointer is None:
         pg = config.postgres
         conn_str = (
             f"host={pg.host} port={pg.port} user={pg.user} "
-            f"password={pg.password} dbname={pg.database} "
-            f"options='-c search_path=autops'"
+            f"password={pg.password} dbname={pg.database}"
         )
         from psycopg import Connection
         from psycopg.rows import dict_row
@@ -75,17 +74,11 @@ def _get_checkpointer() -> PostgresSaver:
         conn = Connection.connect(
             conn_str, autocommit=True, prepare_threshold=0, row_factory=dict_row
         )
-        # 确保 autops schema 存在
-        with conn.cursor() as cur:
-            cur.execute(
-                "CREATE SCHEMA IF NOT EXISTS autops AUTHORIZATION autops;"
-            )
-            conn.commit()
 
         _checkpointer = PostgresSaver(conn)
-        _checkpointer.setup()  # 自动创建所需的表（在 autops schema 中）
+        _checkpointer.setup()  # 自动在 public schema 中创建所需的表
         logger.info(
-            "Checkpointer 已初始化 (PostgresSaver: %s:%d/%s, schema=autops)",
+            "Checkpointer 已初始化 (PostgresSaver: %s:%d/%s, schema=public)",
             pg.host, pg.port, pg.database,
         )
     return _checkpointer
