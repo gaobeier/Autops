@@ -50,6 +50,16 @@ class FeishuConfig(BaseModel):
     encrypt_key: str = ""
 
 
+class PostgresConfig(BaseModel):
+    """PostgreSQL 配置（用于 checkpointer 持久化）。"""
+
+    host: str = "127.0.0.1"
+    port: int = 5432
+    user: str = ""
+    password: str = ""
+    database: str = ""
+
+
 class AppConfig(BaseModel):
     """全局应用配置。"""
 
@@ -57,6 +67,7 @@ class AppConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
+    postgres: PostgresConfig = Field(default_factory=PostgresConfig)
 
     @property
     def logging_level(self) -> int:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from deepagents import create_deep_agent
 from deepagents.backends import LocalShellBackend
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph.state import CompiledStateGraph
 
 from autops.config.settings import config
@@ -18,7 +18,7 @@ from autops.tools import internet_search
 logger = logging.getLogger(__name__)
 
 # 全局 checkpointer 单例（所有会话共享，通过 thread_id 区分）
-_checkpointer: MemorySaver | None = None
+_checkpointer: PostgresSaver | None = None
 
 
 def _resolve_workspace() -> Path:
@@ -54,16 +54,40 @@ def _build_backend(workspace: Path) -> LocalShellBackend:
     )
 
 
-def _get_checkpointer() -> MemorySaver:
+def _get_checkpointer() -> PostgresSaver:
     """获取全局 checkpointer 单例。
 
-    使用 MemorySaver（内存存储），进程重启后丢失。
-    如需持久化，可替换为 SqliteSaver 或 PostgresSaver。
+    使用 PostgresSaver（PostgreSQL 持久化存储），进程重启后不丢失。
+    首次调用时建立连接并自动建表。
+    在 autops schema 中创建表（避免 public schema 权限问题）。
     """
     global _checkpointer
     if _checkpointer is None:
-        _checkpointer = MemorySaver()
-        logger.info("Checkpointer 已初始化 (MemorySaver)")
+        pg = config.postgres
+        conn_str = (
+            f"host={pg.host} port={pg.port} user={pg.user} "
+            f"password={pg.password} dbname={pg.database} "
+            f"options='-c search_path=autops'"
+        )
+        from psycopg import Connection
+        from psycopg.rows import dict_row
+
+        conn = Connection.connect(
+            conn_str, autocommit=True, prepare_threshold=0, row_factory=dict_row
+        )
+        # 确保 autops schema 存在
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE SCHEMA IF NOT EXISTS autops AUTHORIZATION autops;"
+            )
+            conn.commit()
+
+        _checkpointer = PostgresSaver(conn)
+        _checkpointer.setup()  # 自动创建所需的表（在 autops schema 中）
+        logger.info(
+            "Checkpointer 已初始化 (PostgresSaver: %s:%d/%s, schema=autops)",
+            pg.host, pg.port, pg.database,
+        )
     return _checkpointer
 
 
@@ -73,9 +97,9 @@ def create_main_agent() -> CompiledStateGraph:
     通过 LocalShellBackend(root_dir, virtual_mode=False) 将 Agent 的
     文件操作限制在 workspace 目录内，Agent 使用真实绝对路径操作文件。
 
-    通过 MemorySaver checkpointer 自动管理多轮对话状态，
+    通过 PostgresSaver checkpointer 持久化多轮对话状态，
     调用时通过 config={"thread_id": session_id} 区分不同会话，
-    无需手动维护消息历史。
+    进程重启后对话历史不丢失。
 
     通过 interrupt_on 配置人工审批：edit_file / write_file / execute
     等危险操作在执行前暂停，等待人工确认后才继续。

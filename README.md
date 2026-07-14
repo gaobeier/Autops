@@ -85,7 +85,16 @@ agent:
 feishu:
   app_id: cli_xxxxxxxxxxxxxxxx
   app_secret: xxxxxxxxxxxxxxxxxxxxxxxxxx
+
+postgres:
+  host: 127.0.0.1
+  port: 5432
+  user: autops
+  password: your_password
+  database: autops
 ```
+
+> PostgreSQL 用于 checkpointer 持久化对话状态。首次启动时自动创建 `autops` schema 和 4 张 checkpoint 表。
 
 ### 运行
 
