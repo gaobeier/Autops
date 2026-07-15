@@ -10,8 +10,25 @@ from rich.prompt import Prompt
 
 from autops.agents.main_agent import create_main_agent
 from autops.config.settings import config
+from autops.observability import AgentObservabilityHandler
 
 console = Console()
+
+
+class CliEventSink:
+    """CLI 事件输出 — 工具调用过程实时打印，摘要末尾打印。"""
+
+    def notify_tool_start(self, turn: int, tool_name: str, params: str) -> None:
+        console.print(f"[dim]🔧 [Turn {turn}] 调用工具: {tool_name} | 参数: {params}[/dim]")
+
+    def notify_tool_end(self, turn: int, tool_name: str, output: str, elapsed: float) -> None:
+        console.print(f"[dim]✅ [Turn {turn}] {tool_name} 完成 ({elapsed:.1f}s) | 结果: {output}[/dim]")
+
+    def notify_tool_error(self, turn: int, tool_name: str, error: str, elapsed: float) -> None:
+        console.print(f"[red]❌ [Turn {turn}] {tool_name} 错误 ({elapsed:.1f}s): {error}[/red]")
+
+    def notify_summary(self, summary: str) -> None:
+        console.print(Panel(summary, title="[dim]执行统计[/dim]", border_style="dim"))
 
 
 def run_cli() -> None:
@@ -31,6 +48,8 @@ def run_cli() -> None:
     agent = create_main_agent()
     console.print("[green]Agent 就绪，开始对话吧！[/green]\n")
 
+    sink = CliEventSink()
+
     # 多轮对话循环
     messages: list[dict] = []
     while True:
@@ -49,10 +68,14 @@ def run_cli() -> None:
 
         # 调用 Agent
         messages.append({"role": "user", "content": user_input})
+        handler = AgentObservabilityHandler(sink=sink)
         try:
             result = agent.invoke(
                 {"messages": messages},
-                config={"recursion_limit": config.agent.recursion_limit},
+                config={
+                    "recursion_limit": config.agent.recursion_limit,
+                    "callbacks": [handler],
+                },
             )
             # 提取最后一条 AI 回复
             ai_messages = result.get("messages", [])
@@ -74,6 +97,8 @@ def run_cli() -> None:
                     else {"role": "assistant", "content": str(m)}
                     for m in ai_messages
                 ]
+            # 打印本次执行统计
+            handler.summary()
         except Exception as e:  # noqa: BLE001
             console.print(f"[red]错误: {e}[/red]")
         console.print()

@@ -15,15 +15,17 @@ Autops 是一个基于 [Deepagents](https://github.com/langchain-ai/deepagents) 
 
 ```
 src/autops/
-├── agents/      # 智能体定义（主 Agent + 子 Agent，基于 create_deep_agent）
-├── channels/    # 通信渠道（CLI / API / Webhook 交互入口）
-├── config/      # 从 config.yaml 加载全局配置
-├── llm/         # LLM 客户端封装（LangChain 聊天模型）
-├── prompts/     # 提示词与 Jinja2 模板
+├── agents/          # 智能体定义（主 Agent + 子 Agent，基于 create_deep_agent）
+├── channels/        # 通信渠道（CLI / API / Webhook 交互入口）
+├── config/          # 从 config.yaml 加载全局配置
+├── llm/             # LLM 客户端封装（LangChain 聊天模型）
+├── middleware/      # 自定义中间件（AlwaysReloadMemoryMiddleware 等）
+├── observability/   # 可观测性模块（Agent 执行监控、Token 统计、EventSink 协议）
+├── prompts/         # 提示词与 Jinja2 模板
 │   ├── renderer.py   # 模板渲染引擎
 │   ├── system.py     # 提示词构建函数
 │   └── templates/    # .j2 模板文件目录
-└── tools/       # SRE/DevOps 工具集（shell/system/logs/docker/network/git_ops）
+└── tools/           # SRE/DevOps 工具集（shell/system/logs/docker/network/git_ops）
 ```
 
 ## 编码规范
@@ -100,15 +102,17 @@ prompt = render_prompt("main_agent.j2", agent_name="Autops", capabilities=[...])
 ### 模块依赖关系
 
 ```
-channels/ → agents/ → llm/, prompts/, tools/
-               ↓
-            config/（全局配置）
+channels/ → agents/ → llm/, prompts/, tools/, middleware/
+               ↓                      ↓
+            config/（全局配置）    observability/（EventSink 协议）
 ```
 
 - `config/` 是最底层模块，被所有其他模块依赖
 - `llm/` 封装模型客户端，供 `agents/` 使用
 - `prompts/` 提供提示词，供 `agents/` 使用
 - `tools/` 定义工具函数，供 `agents/` 注册
+- `middleware/` 自定义中间件（如 AlwaysReloadMemoryMiddleware），供 `agents/` 使用
+- `observability/` 可观测性回调处理器，channels 通过 `EventSink` 协议接入
 - `channels/` 是最上层，组装 Agent 并提供交互入口
 
 ## 常用命令

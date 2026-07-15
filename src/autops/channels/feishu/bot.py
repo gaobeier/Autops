@@ -16,13 +16,10 @@ import json
 import logging
 import re
 import threading
-from typing import Any
 
 import time
-from uuid import UUID
 
 import lark_oapi as lark
-from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
@@ -32,182 +29,47 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 from lark_oapi.ws.client import Client as WsClient
 
-from autops.agents.main_agent import create_main_agent
+from autops.agents.main_agent import _build_agent
 from autops.channels.feishu.client import FeishuClient
 from autops.channels.feishu.reporter import FeishuReporter
 from autops.config.settings import config
+from autops.observability import AgentObservabilityHandler
 
 logger = logging.getLogger(__name__)
 
 
 # ── 审批卡片会话注册表 ──────────────────────────────────────────
-# thread_id → (reporter, card_message_id)，用于卡片回调后更新卡片并继续发送消息。
-_pending_approvals: dict[str, tuple[FeishuReporter, str]] = {}
+# thread_id → (reporter, card_message_id, user_id)，用于卡片回调后更新卡片并继续发送消息。
+_pending_approvals: dict[str, tuple[FeishuReporter, str, str]] = {}
 _pending_lock = threading.Lock()
 
 
-def _truncate(text: Any, max_len: int = 500) -> str:
-    """截断过长的文本用于日志展示。"""
-    s = str(text)
-    return s if len(s) <= max_len else s[:max_len] + "..."
+class FeishuEventSink:
+    """飞书事件输出适配器 — 实现 EventSink 协议。
 
-
-class AgentObservabilityHandler(BaseCallbackHandler):
-    """Agent 可观测性回调处理器。
-
-    - 每次 LLM 调用递增 Turn 号
-    - 工具调用时实时回调飞书通知
-    - 调用结束后通过 summary() 返回精简统计
+    将通用可观测性事件转换为飞书消息发送。
     """
 
-    def __init__(self, reporter: FeishuReporter | None = None) -> None:
-        self._timings: dict[UUID, float] = {}
-        self._tool_names: dict[UUID, str] = {}
+    def __init__(self, reporter: FeishuReporter) -> None:
         self._reporter = reporter
-        self._start_time = time.monotonic()
-        self._model_name = config.llm.model
-        self._turn = 0
-        self._total_prompt_tokens = 0
-        self._total_completion_tokens = 0
-        self._tool_count = 0
 
-    # ── LLM 相关 ────────────────────────────────────────────────
-
-    def on_chat_model_start(
-        self, serialized: dict, messages: list, *, run_id: UUID, **kwargs: Any
-    ) -> None:
-        kwargs_data = serialized.get("kwargs", {})
-        model = kwargs_data.get("model_name") or kwargs_data.get("model") or self._model_name
-        self._model_name = model
-        self._timings[run_id] = time.monotonic()
-        self._turn += 1
-        msg_count = sum(len(m) for m in messages) if messages else 0
-        logger.info("[Turn %d] 🧠 LLM 请求: model=%s, 消息数=%d", self._turn, model, msg_count)
-
-    def on_llm_start(self, serialized: dict, prompts: list, *, run_id: UUID, **kwargs: Any) -> None:
-        self._timings[run_id] = time.monotonic()
-
-    def on_llm_end(self, response, *, run_id: UUID, **kwargs: Any) -> None:
-        elapsed = self._get_elapsed(run_id)
-        llm_output = getattr(response, "llm_output", None) or {}
-        usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
-        prompt_t = usage.get("prompt_tokens", 0)
-        completion_t = usage.get("completion_tokens", 0)
-        total_t = usage.get("total_tokens", 0)
-        self._total_prompt_tokens += prompt_t
-        self._total_completion_tokens += completion_t
-        token_info = f", tokens: {prompt_t}→{completion_t}(total={total_t})" if total_t else ""
-        logger.info("[Turn %d] 🧠 LLM 响应: 耗时=%.1fs%s", self._turn, elapsed, token_info)
-
-    def on_llm_error(self, error: Exception, *, run_id: UUID, **kwargs: Any) -> None:
-        elapsed = self._get_elapsed(run_id)
-        logger.error("[Turn %d] 🧠 LLM 错误: 耗时=%.1fs, error=%s", self._turn, elapsed, error)
-
-    def on_llm_new_token(self, token: str, *, run_id: UUID, **kwargs: Any) -> None:
-        pass
-
-    # ── 工具相关 ────────────────────────────────────────────────
-
-    def on_tool_start(
-        self, serialized: dict, input_str: str, *, run_id: UUID, **kwargs: Any
-    ) -> None:
-        tool_name = serialized.get("name", "unknown")
-        self._timings[run_id] = time.monotonic()
-        self._tool_names[run_id] = tool_name
-        self._tool_count += 1
-        logger.info("[Turn %d] 🔧 调用工具: %s | 参数: %s", self._turn, tool_name, _truncate(input_str, 200))
-        # 实时回调飞书
-        if self._reporter:
-            try:
-                self._reporter.send_text(
-                    f"🔧 [Turn {self._turn}] 调用工具: {tool_name}\n参数: {_truncate(input_str, 200)}"
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("飞书工具调用通知发送失败")
-
-    def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
-        elapsed = self._get_elapsed(run_id)
-        tool_name = self._tool_names.pop(run_id, "?")
-        output_str = _truncate(output, 500)
-        logger.info("[Turn %d] ✅ 工具结果: 耗时=%.1fs | %s", self._turn, elapsed, output_str)
-        # 实时回调飞书
-        if self._reporter:
-            try:
-                self._reporter.send_text(
-                    f"✅ [Turn {self._turn}] {tool_name} 完成 ({elapsed:.1f}s)\n结果: {_truncate(output, 300)}"
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("飞书工具结果通知发送失败")
-
-    def on_tool_error(self, error: Exception, *, run_id: UUID, **kwargs: Any) -> None:
-        elapsed = self._get_elapsed(run_id)
-        tool_name = self._tool_names.pop(run_id, "?")
-        logger.error("[Turn %d] ❌ 工具错误: 耗时=%.1fs | %s", self._turn, elapsed, error)
-        if self._reporter:
-            try:
-                self._reporter.send_text(
-                    f"❌ [Turn {self._turn}] {tool_name} 错误 ({elapsed:.1f}s): {error}"
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("飞书工具错误通知发送失败")
-
-    # ── Agent 决策 ──────────────────────────────────────────────
-
-    def on_agent_action(self, action, *, run_id: UUID, **kwargs: Any) -> None:
-        tool = getattr(action, "tool", "unknown")
-        log = getattr(action, "log", "")
-        logger.info("[Turn %d] 🤖 Agent 决策: 调用 %s | 思考: %s", self._turn, tool, _truncate(log, 200))
-
-    def on_agent_finish(self, finish, *, run_id: UUID, **kwargs: Any) -> None:
-        log = getattr(finish, "log", "")
-        logger.info("[Turn %d] 🤖 Agent 完成: %s", self._turn, _truncate(log, 200) if log else "无日志")
-
-    # ── 链路追踪 ────────────────────────────────────────────────
-
-    def on_chain_start(
-        self, serialized: dict | None, inputs: dict, *, run_id: UUID, **kwargs: Any
-    ) -> None:
-        self._timings[run_id] = time.monotonic()
-        logger.debug("[Turn %d] ▶ 链路开始: %s", self._turn, (serialized or {}).get("name", "chain"))
-
-    def on_chain_end(self, outputs: dict, *, run_id: UUID, **kwargs: Any) -> None:
-        elapsed = self._get_elapsed(run_id)
-        logger.debug("[Turn %d] ■ 链路结束: 耗时=%.1fs", self._turn, elapsed)
-
-    def on_chain_error(self, error: Exception, *, run_id: UUID, **kwargs: Any) -> None:
-        elapsed = self._get_elapsed(run_id)
-        # Interrupt 是 LangGraph 的正常控制流机制（人工审批暂停），不是错误
-        error_str = str(error)
-        if "Interrupt(" in error_str or "GraphInterrupt" in type(error).__name__:
-            logger.info("[Turn %d] ■ 链路暂停（等待人工审批）", self._turn)
-            return
-        logger.error("[Turn %d] ■ 链路错误: 耗时=%.1fs | %s", self._turn, elapsed, error)
-
-    # ── 重试 ────────────────────────────────────────────────────
-
-    def on_retry(self, retry_state, *, run_id: UUID, **kwargs: Any) -> None:
-        attempt = getattr(retry_state, "attempt_number", "?")
-        logger.warning("[Turn %d] 🔄 重试: 第 %s 次", self._turn, attempt)
-
-    # ── 辅助 ────────────────────────────────────────────────────
-
-    def _get_elapsed(self, run_id: UUID) -> float:
-        start = self._timings.pop(run_id, None)
-        return time.monotonic() - start if start else 0.0
-
-    def summary(self) -> str:
-        """生成统计摘要。"""
-        total_tokens = self._total_prompt_tokens + self._total_completion_tokens
-        total_elapsed = time.monotonic() - self._start_time
-        return (
-            f"📊 执行统计\n"
-            f"🔄 Turn: {self._turn}\n"
-            f"🤖 模型: {self._model_name}\n"
-            f"⏱️ 总耗时: {total_elapsed:.1f}s\n"
-            f"📥 Token 输入: {self._total_prompt_tokens}\n"
-            f"📤 Token 输出: {self._total_completion_tokens}\n"
-            f"🎯 Token 合计: {total_tokens}"
+    def notify_tool_start(self, turn: int, tool_name: str, params: str) -> None:
+        self._reporter.send_text(
+            f"🔧 [Turn {turn}] 调用工具: {tool_name}\n参数: {params}"
         )
+
+    def notify_tool_end(self, turn: int, tool_name: str, output: str, elapsed: float) -> None:
+        self._reporter.send_text(
+            f"✅ [Turn {turn}] {tool_name} 完成 ({elapsed:.1f}s)\n结果: {output}"
+        )
+
+    def notify_tool_error(self, turn: int, tool_name: str, error: str, elapsed: float) -> None:
+        self._reporter.send_text(
+            f"❌ [Turn {turn}] {tool_name} 错误 ({elapsed:.1f}s): {error}"
+        )
+
+    def notify_summary(self, summary: str) -> None:
+        self._reporter.send_text(summary)
 
 
 # ── 消息内容解析 ────────────────────────────────────────────────
@@ -476,7 +338,7 @@ def _on_card_action(event: P2CardActionTrigger) -> dict:
             logger.info("卡片回调无对应会话（已处理或重复点击）: thread_id=%s", thread_id)
             return {"toast": {"type": "info", "content": "已处理，无需重复操作"}}
 
-        reporter, card_message_id = entry
+        reporter, card_message_id, user_id = entry
 
         # 构造 decision
         if decision_type == "approve":
@@ -523,12 +385,14 @@ def _on_card_action(event: P2CardActionTrigger) -> dict:
 
             # 2) 恢复 Agent 执行
             try:
-                agent = create_main_agent()
+                resume_handler = AgentObservabilityHandler(sink=FeishuEventSink(reporter))
+                agent = _build_agent(user_id=user_id or None)
                 result = agent.invoke(
                     Command(resume={"decisions": [decision]}),
                     config={
                         "thread_id": thread_id,
                         "recursion_limit": config.agent.recursion_limit,
+                        "callbacks": [resume_handler],
                     },
                 )
 
@@ -544,7 +408,10 @@ def _on_card_action(event: P2CardActionTrigger) -> dict:
                 # 检查是否还有新的 interrupt（连续多个危险操作）
                 interrupts = result.get("__interrupt__", [])
                 if interrupts:
-                    _handle_interrupts(interrupts, thread_id, reporter)
+                    _handle_interrupts(interrupts, thread_id, reporter, user_id=user_id)
+                else:
+                    # 正常完成，发送执行统计（summary 内部会通过 sink 发送到飞书）
+                    resume_handler.summary()
             except Exception:  # noqa: BLE001
                 logger.exception("后台 Agent 执行出错")
 
@@ -562,6 +429,7 @@ def _handle_interrupts(
     interrupts: list,
     thread_id: str,
     reporter: FeishuReporter,
+    user_id: str = "",
 ) -> bool:
     """处理 Agent 返回的 interrupt，发送审批卡片。
 
@@ -569,6 +437,7 @@ def _handle_interrupts(
         interrupts: Agent 返回的 interrupt 列表。
         thread_id: LangGraph 会话 ID。
         reporter: 飞书消息报告器。
+        user_id: 用户标识（用于审批后恢复时加载对应用户的长期记忆）。
 
     Returns:
         True 表示有 interrupt 需要处理（已发送卡片），False 表示无。
@@ -598,9 +467,9 @@ def _handle_interrupts(
     except (AttributeError, TypeError):
         pass
 
-    # 注册等待审批：thread_id → (reporter, card_message_id)
+    # 注册等待审批：thread_id → (reporter, card_message_id, user_id)
     with _pending_lock:
-        _pending_approvals[thread_id] = (reporter, card_message_id)
+        _pending_approvals[thread_id] = (reporter, card_message_id, user_id)
 
     logger.info("已发送审批卡片: thread_id=%s, card_msg_id=%s", thread_id, card_message_id)
     return True
@@ -655,8 +524,8 @@ def _handle_message(
         logger.exception("发送思考中提示失败")
 
     try:
-        handler = AgentObservabilityHandler(reporter=reporter)
-        agent = create_main_agent()
+        handler = AgentObservabilityHandler(sink=FeishuEventSink(reporter))
+        agent = _build_agent(user_id=user_id)
         result = agent.invoke(
             {"messages": [user_msg]},
             config={
@@ -670,7 +539,7 @@ def _handle_message(
         # 检查是否触发 interrupt（人工审批）
         interrupts = result.get("__interrupt__", [])
         if interrupts:
-            if _handle_interrupts(interrupts, thread_id, reporter):
+            if _handle_interrupts(interrupts, thread_id, reporter, user_id=user_id):
                 # 已发送审批卡片，等待用户在飞书中点击按钮
                 return
 
@@ -681,8 +550,8 @@ def _handle_message(
             reply_str = str(reply)
             logger.info("回复长度: %d 字符", len(reply_str))
             reporter.send_text(reply_str)
-            # 发送执行统计
-            reporter.send_text(handler.summary())
+            # 发送执行统计（summary 内部会通过 sink 自动发送到飞书）
+            handler.summary()
         else:
             logger.warning("Agent 返回空消息列表")
             reporter.send_text("⚠️ 未收到回复")
