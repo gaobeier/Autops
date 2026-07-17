@@ -19,7 +19,7 @@ src/autops/
 ├── channels/        # 通信渠道（CLI / API / Webhook 交互入口）
 ├── config/          # 从 config.yaml 加载全局配置
 ├── llm/             # LLM 客户端封装（LangChain 聊天模型）
-├── middleware/      # 自定义中间件（AlwaysReloadMemoryMiddleware 等）
+├── middleware/      # 自定义中间件（AlwaysReloadMemoryMiddleware、CommandSafetyMiddleware）
 ├── observability/   # 可观测性模块（Agent 执行监控、Token 统计、EventSink 协议）
 ├── prompts/         # 提示词与 Jinja2 模板
 │   ├── renderer.py   # 模板渲染引擎

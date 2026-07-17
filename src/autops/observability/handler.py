@@ -326,6 +326,54 @@ class AgentObservabilityHandler(BaseCallbackHandler):
             self._turn, tool_name, _truncate(output, 300), elapsed,
         )
 
+        # write_todos 特殊处理：解析任务进度并通过 sink 发送
+        if tool_name == "write_todos":
+            todos_text = self._format_todos(output)
+            if todos_text:
+                safe_call(
+                    self._sink, "notify_tool_start",
+                    self._turn, "📋 任务进度", todos_text,
+                )
+
+    def _format_todos(self, output: Any) -> str:
+        """从 write_todos 的输出中解析任务列表，格式化为可读文本。"""
+        try:
+            # output 是 Command 对象，含 update={"todos": [...]}
+            update = getattr(output, "update", None) or {}
+            if isinstance(update, dict):
+                todos = update.get("todos", [])
+            elif isinstance(update, list):
+                todos = update
+            else:
+                # 尝试从 output 本身解析
+                todos = output if isinstance(output, list) else []
+
+            if not todos:
+                return ""
+
+            status_icon = {
+                "pending": "⬜",
+                "in_progress": "🔄",
+                "completed": "✅",
+            }
+            lines = []
+            for i, todo in enumerate(todos, 1):
+                if isinstance(todo, dict):
+                    content = todo.get("content", "?")
+                    status = todo.get("status", "pending")
+                    icon = status_icon.get(status, "❓")
+                    lines.append(f"{icon} {i}. {content} [{status}]")
+
+            if not lines:
+                return ""
+
+            total = len(lines)
+            done = sum(1 for t in todos if isinstance(t, dict) and t.get("status") == "completed")
+            header = f"📋 任务进度 ({done}/{total})"
+            return header + "\n" + "\n".join(lines)
+        except Exception:  # noqa: BLE001
+            return ""
+
     def on_tool_error(self, error: Exception, *, run_id: UUID, **kwargs: Any) -> None:
         elapsed = self._get_elapsed(run_id)
         tool_name = self._tool_names.pop(run_id, "?")

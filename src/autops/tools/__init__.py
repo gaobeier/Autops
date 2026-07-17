@@ -2,14 +2,22 @@
 
 本模块提供 Agent 可调用的自定义工具：
 - search：互联网搜索（基于 Tavily API）
-- shell：Shell 命令执行（规划中）
-- system：系统资源监控（规划中）
-- logs：日志读取与分析（规划中）
-- docker：Docker 容器管理（规划中）
-- network：网络诊断（规划中）
-- git_ops：Git 仓库操作（规划中）
+- dangerous_commands：命令安全策略（三级风险检测）
+- virtual_execute：受限的 Shell 命令执行（可选，使用 bwrap 沙箱）
 """
 
+from autops.tools.dangerous_commands import (
+    assess_command,
+    is_critical_command,
+    should_interrupt_execute,
+)
 from autops.tools.search import internet_search
+from autops.tools.virtual_execute import create_virtual_execute_tool
 
-__all__ = ["internet_search"]
+__all__ = [
+    "internet_search",
+    "create_virtual_execute_tool",
+    "assess_command",
+    "is_critical_command",
+    "should_interrupt_execute",
+]

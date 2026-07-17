@@ -18,8 +18,10 @@ Autops 是一个面向 SRE（站点可靠性工程）和 DevOps 工作的 AI 智
 | **子智能体** | 将复杂任务委派给具有独立上下文的子 Agent |
 | **上下文管理** | 自动总结长对话，防止上下文溢出；统计 token 用量并显示各部分占比（系统提示词/工具/对话消息/其他开销） |
 | **长期记忆** | 通过 `workspace/memory/{user_id}/AGENTS.md` 文件持久化跨会话记忆，按用户隔离；Agent 可自主写入重要事实，每次 LLM 调用自动注入到 system prompt |
+| **Store 三种长期记忆** | 基于 PostgresStore + pgvector：情景记忆（按用户隔离，存事件）、语义记忆（全局共享，存事实知识）、程序记忆（全局共享，存操作流程）；Agent 通过工具按需查询，支持向量语义搜索 |
 | **可观测性** | `AgentObservabilityHandler` 回调处理器跟踪 Turn 号、token 用量、上下文窗口占比；通过 `EventSink` 协议对接各 channel（飞书/CLI） |
-| **人在回路** | `edit_file`、`execute` 等危险操作执行前暂停；LangGraph Studio 中通过 Resume UI 审批，飞书通道中通过交互式卡片审批 |
+| **命令安全** | 三级安全策略：高危（硬编码直接拒绝）、危险（config.yaml 可配，人工审批）、低风险（放行） |
+| **人在回路** | `edit_file` 全部审批；`execute` 按安全策略审批；LangGraph Studio 中通过 Resume UI 审批，飞书通道中通过交互式卡片审批 |
 | **飞书通道** | 通过飞书 Bot WebSocket 长连接接收消息，支持群聊 @提及、图片和审批卡片交互 |
 
 ## 技术栈
@@ -94,10 +96,19 @@ postgres:
   user: autops
   password: your_password
   database: autops
+
+store:
+  enabled: true                      # 启用 Store 长期记忆（需要 pgvector 扩展）
+  embedding:
+    model: text-embedding-v4         # 阿里 DashScope embedding 模型
+    api_key: sk-xxxxxxxxxxxx         # DASHSCOPE_API_KEY
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    dims: 1024                       # text-embedding-v4 默认 1024 维
 ```
 
 > PostgreSQL 用于 checkpointer 持久化对话状态。首次启动时在 `public` schema 自动创建 4 张 checkpoint 表。
 > 注意：PG 15+ 默认不允许普通用户在 public schema 建表，需 superuser 执行 `ALTER SCHEMA public OWNER TO autops;`。
+> Store 长期记忆需要 pgvector 扩展，首次启动时会自动创建 `store` 表和 `store_vectors` 向量索引表。
 
 ### 运行
 
@@ -161,10 +172,16 @@ autops/
 │   ├── config/                  # 全局配置与环境管理
 │   ├── llm/                     # LLM 客户端封装
 │   ├── middleware/              # 自定义中间件
-│   │   └── memory.py            # AlwaysReloadMemoryMiddleware（每次重读 AGENTS.md）
+│   │   ├── memory.py            # AlwaysReloadMemoryMiddleware（每次重读 AGENTS.md）
+│   │   └── safety.py            # CommandSafetyMiddleware（高危命令拦截）
 │   ├── observability/           # 可观测性模块（Agent 执行监控、Token 统计）
 │   │   ├── handler.py            # AgentObservabilityHandler 回调处理器
 │   │   └── sink.py               # EventSink 协议（各 channel 实现以接收事件）
+│   ├── store/                   # 跨会话长期记忆（PostgresStore + pgvector）
+│   │   ├── __init__.py           # Store 初始化与 OpenAI 兼容 Embedding 封装
+│   │   ├── episodic.py           # 情景记忆工具（save_event/search_events，按用户隔离）
+│   │   ├── semantic.py           # 语义记忆工具（save_knowledge/search_knowledge，全局共享）
+│   │   └── procedural.py         # 程序记忆工具（save_procedure/match_procedure，全局共享）
 │   ├── prompts/                 # 系统提示词与 Jinja2 模板
 │   │   ├── renderer.py          # 模板渲染引擎
 │   │   ├── system.py            # 提示词构建函数
@@ -192,8 +209,9 @@ autops/
 | `channels/` | 定义 Agent 与用户交互的入口：CLI 对话、飞书 Webhook |
 | `config/` | 从 `config.yaml` 加载配置，管理模型参数和运行时选项 |
 | `llm/` | 封装 LangChain 聊天模型客户端，支持多模型切换 |
-| `middleware/` | 自定义 DeepAgents 中间件：`AlwaysReloadMemoryMiddleware`（每次 invoke 重读 AGENTS.md，绕过 checkpointer 缓存） |
+| `middleware/` | 自定义 DeepAgents 中间件：`AlwaysReloadMemoryMiddleware`（每次重读 AGENTS.md）、`CommandSafetyMiddleware`（高危命令拦截） |
 | `observability/` | Agent 执行可观测性回调：Token 用量、上下文窗口占比、工具调用统计。各 channel 通过实现 `EventSink` 协议接入 |
+| `store/` | 跨会话长期记忆（PostgresStore + pgvector）：episodic（情景，按用户隔离）、semantic（语义，全局）、procedural（程序，全局）。Agent 通过工具按需查询，支持向量语义搜索 |
 | `prompts/` | 使用 Jinja2 模板（`.j2`）管理系统提示词，支持变量渲染 |
 | `tools/` | 自定义工具函数，供 Agent 通过 function calling 调用 |
 

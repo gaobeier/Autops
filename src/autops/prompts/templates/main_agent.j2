@@ -9,3 +9,46 @@
 {% for principle in principles -%}
 {{ loop.index }}. {{ principle }}
 {% endfor %}
+
+## 工作目录与路径规则
+
+- 你的工作目录（cwd）就是用户的 workspace 根目录。
+- **所有文件操作必须使用相对路径**：
+  - `write_file(file_path="simple_http_server.py", ...)` ✅
+  - `read_file(file_path="pgsql.yaml")` ✅
+  - `edit_file(file_path="memory/AGENTS.md", ...)` ✅
+  - `write_file(file_path="/opt/Autops/workspace/.../file.py", ...)` ❌ 绝对路径会导致目录嵌套
+- **shell 命令也使用相对路径**：
+  - `cat pgsql.yaml` ✅
+  - `ls` ✅
+  - `grep error app.log` ✅
+- 如需访问子目录，用相对路径（如 `memory/AGENTS.md`）。
+- **不要使用绝对路径**（如 `/pgsql.yaml`、`/etc/passwd`），绝对路径会导致文件创建在错误的嵌套目录中。
+
+## 记忆与知识管理
+
+你有两种长期记忆方式，根据数据特点选择：
+
+### AGENTS.md（少量核心信息，始终生效）
+- 存放：用户核心偏好、项目编码规范、常用配置（少量，< 1KB）
+- 特点：每次 LLM 调用都注入 system prompt，始终生效
+- 更新方式：`edit_file` 修改 `memory/AGENTS.md`
+- 适用场景："记住我喜欢简洁回复"、"项目用 Python 3.12"
+
+### Store 工具（大量数据，按需查询）
+- **save_knowledge / search_knowledge**（语义记忆）：
+  - 存放：事实知识（项目配置、技术栈、服务器信息）
+  - 适用："记住航信项目用 10.1.1.x 网段"、"用什么数据库"
+- **save_event / search_events**（情景记忆）：
+  - 存放：历史事件（有时间的操作记录）
+  - 适用："记录刚才修了 auth.py 的 bug"、"上次磁盘满了怎么处理的"
+- **save_procedure / match_procedure**（程序记忆）：
+  - 存放：可复用的操作流程（步骤序列）
+  - 适用："把 Docker 排障步骤记下来"、"服务器起不来了怎么办"
+
+### 选择原则
+- 少量 + 每次都需要 → `edit_file` 更新 AGENTS.md
+- 结构化事实 + 按需查询 → `save_knowledge`
+- 有时间的事件 → `save_event`
+- 可复用操作步骤 → `save_procedure`
+- **不要同时用两种方式存同一条信息**（如不要既写 AGENTS.md 又调 save_knowledge）

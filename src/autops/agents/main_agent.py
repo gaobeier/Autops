@@ -12,9 +12,13 @@ from langgraph.graph.state import CompiledStateGraph
 
 from autops.config.settings import config
 from autops.llm.client import create_llm
-from autops.middleware import AlwaysReloadMemoryMiddleware
+from autops.middleware import AlwaysReloadMemoryMiddleware, CommandSafetyMiddleware
 from autops.prompts.system import get_main_agent_prompt
-from autops.tools import internet_search
+from autops.store import get_store
+from autops.store.episodic import _make_episodic_tools
+from autops.store.procedural import _make_procedural_tools
+from autops.store.semantic import _make_semantic_tools
+from autops.tools import internet_search, should_interrupt_execute
 
 logger = logging.getLogger(__name__)
 
@@ -22,24 +26,40 @@ logger = logging.getLogger(__name__)
 _checkpointer: PostgresSaver | None = None
 
 # 会话根目录（所有用户的 session 数据存放于此）
+# 模块级别预创建（在 LangGraph dev 的线程池中执行，允许阻塞 I/O）
 _SESSION_ROOT = Path(config.agent.workspace).resolve() / "session"
 _SESSION_ROOT.mkdir(parents=True, exist_ok=True)
+
+# 预创建 default 用户工作空间（LangGraph dev / CLI 用）
+_DEFAULT_WORKSPACE = _SESSION_ROOT / "default" / "workspace"
+_DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
+# 预创建 default 的 memory 目录
+(_DEFAULT_WORKSPACE / "memory").mkdir(parents=True, exist_ok=True)
 logger.info("会话根目录: %s", _SESSION_ROOT)
 
 
 def _get_user_workspace(user_id: str) -> Path:
-    """获取用户工作空间路径。
+    """获取用户工作空间路径（不做 I/O）。
 
     目录结构: session/{user_id}/workspace/
+    目录由调用方在非事件循环线程中创建（飞书 channel 的处理线程）。
+    LangGraph dev 只用 default workspace（模块级别已预创建）。
 
     Args:
         user_id: 用户标识（如飞书 open_id）。
 
     Returns:
-        用户工作空间目录路径（已创建）。
+        用户工作空间目录路径（可能尚未创建）。
     """
+    if user_id == "default":
+        return _DEFAULT_WORKSPACE
     ws = _SESSION_ROOT / user_id / "workspace"
-    ws.mkdir(parents=True, exist_ok=True)
+    # 飞书 channel 在独立线程中调用，可以阻塞
+    # LangGraph dev 只走 default 分支，不会到这里
+    if not ws.exists():
+        ws.mkdir(parents=True, exist_ok=True)
+        # 同时创建 memory 子目录
+        (ws / "memory").mkdir(parents=True, exist_ok=True)
     return ws
 
 
@@ -96,6 +116,9 @@ def _build_memory_middleware(workspace: Path, user_id: str | None = None) -> lis
 
     记忆文件路径: workspace/memory/AGENTS.md（在用户 workspace 内）
 
+    注意：本函数不做 mkdir（避免事件循环中的阻塞 I/O）。
+    memory 目录由飞书 channel 的处理线程创建，或由 Agent 的 write_file 工具自动创建。
+
     Args:
         workspace: 用户工作空间路径。
         user_id: 用户标识（仅用于日志）。
@@ -103,11 +126,9 @@ def _build_memory_middleware(workspace: Path, user_id: str | None = None) -> lis
     Returns:
         中间件列表（可能为空）。
     """
-    memory_dir = workspace / "memory"
-    memory_dir.mkdir(parents=True, exist_ok=True)
     memory_path = "/memory/AGENTS.md"
-
     real_path = workspace / memory_path.lstrip("/")
+
     if not real_path.exists():
         logger.info(
             "长期记忆文件不存在，跳过加载: user_id=%s, path=%s",
@@ -149,17 +170,44 @@ def _build_agent(user_id: str | None = None) -> CompiledStateGraph:
     workspace = _get_user_workspace(uid)
     logger.info("用户工作空间: %s (user_id=%s)", workspace, uid)
 
+    # 安全策略（三级）：
+    # 1. 高危（硬编码）：CommandSafetyMiddleware 拦截，直接拒绝
+    # 2. 危险（config.yaml 可配）：should_interrupt_execute 谓词，触发人工审批
+    # 3. 低风险（默认）：直接放行
+    from langchain.agents.middleware import InterruptOnConfig
+
+    # 中间件列表：安全拦截 + 长期记忆
+    middleware = [
+        CommandSafetyMiddleware(),
+        *_build_memory_middleware(workspace, uid),
+    ]
+
+    # 工具列表
+    tools = [internet_search]
+
+    # Store（长期记忆：情景/语义/程序）
+    store = get_store()
+    if store is not None:
+        tools.extend(_make_episodic_tools(uid))   # 情景记忆（按用户隔离）
+        tools.extend(_make_semantic_tools())       # 语义记忆（全局共享）
+        tools.extend(_make_procedural_tools())     # 程序记忆（全局共享）
+        logger.info("已加载 Store 工具: episodic + semantic + procedural")
+
     return create_deep_agent(
         model=create_llm(),
-        tools=[internet_search],
+        tools=tools,
         system_prompt=get_main_agent_prompt(),
         backend=_build_backend(workspace),
         checkpointer=_get_checkpointer(),
+        store=store,
         interrupt_on={
             "edit_file": True,
-            "execute": True,
+            "execute": InterruptOnConfig(
+                allowed_decisions=["approve", "reject"],
+                when=should_interrupt_execute,
+            ),
         },
-        middleware=_build_memory_middleware(workspace, uid),
+        middleware=middleware,
     )
 
 
