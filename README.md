@@ -23,6 +23,7 @@ Autops 是一个面向 SRE（站点可靠性工程）和 DevOps 工作的 AI 智
 | **命令安全** | 三级安全策略：高危（硬编码直接拒绝）、危险（config.yaml 可配，人工审批）、低风险（放行） |
 | **人在回路** | `edit_file` 全部审批；`execute` 按安全策略审批；LangGraph Studio 中通过 Resume UI 审批，飞书通道中通过交互式卡片审批 |
 | **飞书通道** | 通过飞书 Bot WebSocket 长连接接收消息，支持群聊 @提及、图片和审批卡片交互 |
+| **RAGFlow 知识库** | 接入外部 RAGFlow 知识库，Agent 通过 `search_rag_knowledge` 工具检索运维文档、故障方案、操作手册等已沉淀的团队知识 |
 
 ## 技术栈
 
@@ -104,6 +105,14 @@ store:
     api_key: sk-xxxxxxxxxxxx         # DASHSCOPE_API_KEY
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     dims: 1024                       # text-embedding-v4 默认 1024 维
+
+ragflow:
+  enabled: true                      # 启用 RAGFlow 知识库检索
+  api_key: ragflow-xxxxxxxxxxxx      # RAGFlow API Key
+  base_url: http://10.200.200.105:13120  # RAGFlow 服务地址
+  dataset_ids: []                    # 留空搜索全部知识库，或填入指定知识库 ID
+  similarity_threshold: 0.2          # 相似度阈值
+  top_k: 5                           # 默认返回条数
 ```
 
 > PostgreSQL 用于 checkpointer 持久化对话状态。首次启动时在 `public` schema 自动创建 4 张 checkpoint 表。
@@ -177,6 +186,10 @@ autops/
 │   ├── observability/           # 可观测性模块（Agent 执行监控、Token 统计）
 │   │   ├── handler.py            # AgentObservabilityHandler 回调处理器
 │   │   └── sink.py               # EventSink 协议（各 channel 实现以接收事件）
+│   ├── rag/                     # 外部知识库检索（RAGFlow）
+│   │   ├── __init__.py           # 模块导出
+│   │   ├── client.py             # RAGFlow SDK 客户端封装
+│   │   └── tools.py              # Agent 检索工具（search_rag_knowledge）
 │   ├── store/                   # 跨会话长期记忆（PostgresStore + pgvector）
 │   │   ├── __init__.py           # Store 初始化与 OpenAI 兼容 Embedding 封装
 │   │   ├── episodic.py           # 情景记忆工具（save_event/search_events，按用户隔离）
@@ -211,6 +224,7 @@ autops/
 | `llm/` | 封装 LangChain 聊天模型客户端，支持多模型切换 |
 | `middleware/` | 自定义 DeepAgents 中间件：`AlwaysReloadMemoryMiddleware`（每次重读 AGENTS.md）、`CommandSafetyMiddleware`（高危命令拦截） |
 | `observability/` | Agent 执行可观测性回调：Token 用量、上下文窗口占比、工具调用统计。各 channel 通过实现 `EventSink` 协议接入 |
+| `rag/` | 外部知识库检索（RAGFlow SDK）：封装 `search_rag_knowledge` 工具，Agent 按需检索运维文档、故障方案等已沉淀知识 |
 | `store/` | 跨会话长期记忆（PostgresStore + pgvector）：episodic（情景，按用户隔离）、semantic（语义，全局）、procedural（程序，全局）。Agent 通过工具按需查询，支持向量语义搜索 |
 | `prompts/` | 使用 Jinja2 模板（`.j2`）管理系统提示词，支持变量渲染 |
 | `tools/` | 自定义工具函数，供 Agent 通过 function calling 调用 |

@@ -131,6 +131,17 @@ class StoreConfig(BaseModel):
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
 
 
+class RagflowConfig(BaseModel):
+    """RAGFlow 知识库检索配置。"""
+
+    enabled: bool = False
+    api_key: str = ""
+    base_url: str = "http://127.0.0.1:9380"
+    dataset_ids: list[str] = Field(default_factory=list)
+    similarity_threshold: float = 0.2
+    top_k: int = 5
+
+
 class AppConfig(BaseModel):
     """全局应用配置。"""
 
@@ -140,6 +151,7 @@ class AppConfig(BaseModel):
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
     postgres: PostgresConfig = Field(default_factory=PostgresConfig)
     store: StoreConfig = Field(default_factory=StoreConfig)
+    ragflow: RagflowConfig = Field(default_factory=RagflowConfig)
 
     @property
     def logging_level(self) -> int:

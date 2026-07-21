@@ -18,6 +18,7 @@ from autops.store import get_store
 from autops.store.episodic import _make_episodic_tools
 from autops.store.procedural import _make_procedural_tools
 from autops.store.semantic import _make_semantic_tools
+from autops.rag.tools import search_rag_knowledge
 from autops.tools import internet_search, should_interrupt_execute
 
 logger = logging.getLogger(__name__)
@@ -184,6 +185,12 @@ def _build_agent(user_id: str | None = None) -> CompiledStateGraph:
 
     # 工具列表
     tools = [internet_search]
+
+    # RAGFlow 知识库检索工具
+    from autops.config.settings import config as _cfg
+    if _cfg.ragflow.enabled:
+        tools.append(search_rag_knowledge)
+        logger.info("已加载 RAGFlow 知识库检索工具: search_rag_knowledge")
 
     # Store（长期记忆：情景/语义/程序）
     store = get_store()

@@ -2465,3 +2465,183 @@ agent = _build_agent(user_id=user_id)
 - `im:message` — 发送/接收消息
 - `im:message.patches` — 更新已发送的卡片消息（审批后更新状态用）
 - `im:message.group_at_msg` — 接收群聊 @ 提及
+
+---
+
+## 17. RAGFlow 知识库集成实践
+
+Autops 项目通过 RAGFlow 实现外部知识库检索。RAGFlow 仅用于**知识检索**（retrieve），不涉及文档管理（上传/解析/切片等由 RAGFlow 平台侧完成）。
+
+### 17.1 架构设计
+
+```
+config.yaml (ragflow 配置段)
+    ↓
+settings.py (RagflowConfig Pydantic 模型)
+    ↓
+rag/client.py (RAGFlowClient 单例，封装 ragflow_sdk)
+    ↓
+rag/tools.py (search_rag_knowledge 工具函数)
+    ↓
+agents/main_agent.py (条件注册工具 + 提示词引导)
+```
+
+**模块职责**：
+
+| 文件 | 职责 |
+|------|------|
+| `config/settings.py` → `RagflowConfig` | 配置解析：enabled、api_key、base_url、dataset_ids、similarity_threshold、top_k |
+| `rag/client.py` → `RAGFlowClient` | SDK 封装：全局单例，暴露 `retrieve()` 方法 |
+| `rag/tools.py` → `search_rag_knowledge` | Agent 工具：调用 client，格式化输出（含来源、相似度） |
+| `agents/main_agent.py` | 条件注册：`if config.ragflow.enabled` 才加载工具 |
+
+### 17.2 配置结构
+
+```yaml
+# config.yaml
+ragflow:
+  enabled: true
+  api_key: "ragflow-xxx"
+  base_url: "http://10.200.200.105:13120"
+  dataset_ids:
+    - "89db73d481c411f19f2451e1fbfdeff0"   # 运维知识库
+  similarity_threshold: 0.2
+  top_k: 5
+```
+
+对应 Pydantic 模型：
+
+```python
+class RagflowConfig(BaseModel):
+    enabled: bool = False
+    api_key: str = ""
+    base_url: str = "http://127.0.0.1:9380"
+    dataset_ids: list[str] = Field(default_factory=list)
+    similarity_threshold: float = 0.2
+    top_k: int = 5
+```
+
+### 17.3 ragflow_sdk 使用要点
+
+**依赖**：`ragflow-sdk>=0.26.0`（pyproject.toml）
+
+**初始化**：
+
+```python
+from ragflow_sdk import RAGFlow
+
+rag = RAGFlow(api_key="ragflow-xxx", base_url="http://host:port")
+```
+
+**检索**：
+
+```python
+chunks = rag.retrieve(
+    dataset_ids=["dataset_id"],
+    question="用户问题",
+    page_size=5,
+    similarity_threshold=0.2,
+)
+# chunk 对象属性: content, similarity, document_name, document_keyword, dataset_name, document_id
+```
+
+**列出数据集**（调试用）：
+
+```python
+datasets = rag.list_datasets()
+for ds in datasets:
+    print(ds.id, ds.name)
+```
+
+### 17.4 客户端单例模式
+
+```python
+_client: RAGFlowClient | None = None
+
+def get_ragflow_client() -> RAGFlowClient | None:
+    global _client
+    if _client is not None:
+        return _client
+    # 检查配置 → 创建客户端 → 缓存单例
+    ragflow_cfg = config.ragflow
+    if not ragflow_cfg.enabled or not ragflow_cfg.api_key:
+        return None
+    _client = RAGFlowClient(
+        api_key=ragflow_cfg.api_key,
+        base_url=ragflow_cfg.base_url,
+        dataset_ids=ragflow_cfg.dataset_ids,
+        similarity_threshold=ragflow_cfg.similarity_threshold,
+        top_k=ragflow_cfg.top_k,
+    )
+    return _client
+```
+
+**设计要点**：
+- 懒加载：首次调用时才初始化 SDK 连接
+- 全局单例：避免重复创建 RAGFlow 连接
+- 优雅降级：未启用或配置缺失时返回 None，工具返回提示信息而非报错
+
+### 17.5 工具注册与提示词引导
+
+**条件注册**（main_agent.py）：
+
+```python
+from autops.rag.tools import search_rag_knowledge
+from autops.config.settings import config as _cfg
+
+tools = [internet_search]
+if _cfg.ragflow.enabled:
+    tools.append(search_rag_knowledge)
+    logger.info("已加载 RAGFlow 知识库检索工具: search_rag_knowledge")
+```
+
+**提示词引导**（main_agent.j2）：
+
+```jinja2
+## 外部知识库（RAGFlow）
+当遇到运维相关问题时，优先使用 `search_rag_knowledge` 工具从知识库检索：
+- 运维文档、故障排查方案、操作手册
+- 架构说明、配置规范、历史案例
+- 任何已沉淀的团队知识
+**使用原则**：用户问题涉及已有文档/规范/历史案例时，先检索再回答，避免重复造轮子。
+```
+
+### 17.6 与 Store、AGENTS.md 的协作关系
+
+Autops 有三种知识体系，定位各不相同：
+
+| 知识体系 | 注入方式 | 生命周期 | 适用场景 |
+|---------|---------|---------|---------|
+| AGENTS.md | 始终注入 system prompt | 全局/永久 | Agent 行为规范、核心指令 |
+| Store | Agent 按需查询（store_get/store_put） | 会话级/持久化 | 对话中产生的临时知识、用户偏好 |
+| RAGFlow | Agent 按需调用 search_rag_knowledge | 外部持久化 | 团队运维文档、操作手册、历史案例 |
+
+**检索优先级建议**：
+1. 先判断 AGENTS.md 中是否已有答案（已在上下文中，无需额外调用）
+2. 运维知识 → 调用 `search_rag_knowledge`
+3. 对话中产生的新知识 → 通过 Store 持久化
+
+### 17.7 踩坑经验
+
+**1. API Key 认证**：
+- RAGFlow SDK 使用 `Authorization: Bearer <api_key>` 认证
+- API Key 格式为 `ragflow-xxx`，需在 RAGFlow 平台生成
+- 遇到 401 时，优先检查 Key 是否过期或被重置
+
+**2. httpx vs ragflow_sdk**：
+- 最初尝试用 httpx 直接调 REST API（`POST /api/v1/retrieval`），认证方式难以对齐
+- 最终改用 `ragflow_sdk`，与官方保持一致，减少兼容性问题
+- **教训**：优先使用官方 SDK，避免自行对接 REST API 的认证细节
+
+**3. retrieve 返回 0 条结果**：
+- RAGFlow 的 retrieve 有 `similarity_threshold` 过滤，低于阈值的结果不返回
+- 知识库中文档内容要与查询语义相关才能命中
+- 调试时先用 `list_datasets()` 确认数据集 ID 正确，再用宽泛的查询测试
+
+**4. 依赖安装的文件锁问题**：
+- Windows 下 `uv sync` / `uv add` 可能因进程占用 `.venv` 中的文件而失败
+- 解决：`tasklist | grep autops` 找到占用进程 → `taskkill /PID xxx /F` 终止后重试
+
+**5. base_url 格式**：
+- 必须包含 `http://` 前缀，如 `http://10.200.200.105:13120`
+- 不要以 `/` 结尾
